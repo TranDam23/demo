@@ -1,0 +1,678 @@
+AWS_REGION=ap-southeast-1
+BUCKET_NAME=ongki-s3-613574620542-ap-southeast-1-an
+AWS_ACCESS_KEY_ID=AKIAY5W7FWV7L4SQR7YB
+AWS_SECRET_ACCESS_KEY=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
+
+- config/dynamodb.js:
+
+import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
+import { DynamoDBDocumentClient } from "@aws-sdk/lib-dynamodb";
+import dotenv from "dotenv";
+
+dotenv.config();
+
+const client = new DynamoDBClient({
+  region: process.env.AWS_REGION,
+  credentials: {
+    accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY
+  }
+});
+
+export const docClient = DynamoDBDocumentClient.from(client);
+
+- config/s3.js:
+
+import { S3Client } from "@aws-sdk/client-s3";
+import dotenv from "dotenv";
+dotenv.config();
+
+export const s3 = new S3Client({
+  region: process.env.AWS_REGION,
+  credentials: {
+    accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY
+  }
+});
+
+- controllers/ticketController.js:
+
+import { ScanCommand, PutCommand, DeleteCommand,UpdateCommand,GetCommand} from "@aws-sdk/lib-dynamodb";
+import { docClient } from "../config/dynamodb.js";
+import { s3 } from "../config/s3.js";
+import {PutObjectCommand,DeleteObjectCommand} from "@aws-sdk/client-s3";
+import { v4 as uuidv4 } from "uuid";
+
+// ================== GET ALL ==================
+export const getAllTickets = async (req, res) => {
+  const data = await docClient.send(
+    new ScanCommand({ TableName: "EventTickets" })
+  );
+
+  res.render("index", { tickets: data.Items || [] });
+};
+
+// ================== GET DETAIL ==================
+export const getTicketById = async (req, res) => {
+  const data = await docClient.send(
+    new GetCommand({
+      TableName: "EventTickets",
+      Key: { ticketId: req.params.id }
+    })
+  );
+
+  res.render("detail", { ticket: data.Item });
+};
+
+// ================== CREATE ==================
+export const createTicket = async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.send("Chưa chọn ảnh");
+    }
+
+    const {
+      eventName,
+      holderName,
+      category,
+      quantity,
+      pricePerTicket,
+      eventDate,
+      status
+    } = req.body;
+
+    const q = Number(quantity);
+    const p = Number(pricePerTicket);
+
+    if (q <= 0 || p <= 0) {
+      return res.send("Quantity & price phải > 0");
+    }
+
+    const id = uuidv4();
+    const imageKey = `tickets/${id}-${req.file.originalname}`;
+
+    // ===== UPLOAD S3 =====
+    await s3.send(
+      new PutObjectCommand({
+        Bucket: process.env.BUCKET_NAME,
+        Key: imageKey,
+        Body: req.file.buffer,
+        ContentType: req.file.mimetype
+      })
+    );
+
+    const imageUrl = `https://${process.env.BUCKET_NAME}.s3.${process.env.AWS_REGION}.amazonaws.com/${imageKey}`;
+
+    // ===== BUSINESS =====
+    const totalAmount = q * p;
+    let finalAmount = totalAmount;
+    let discountLabel = "Không giảm giá";
+
+    if (category === "VIP" && q >= 4) {
+      finalAmount *= 0.9;
+      discountLabel = "Được giảm giá";
+    } else if (category === "VVIP" && q >= 2) {
+      finalAmount *= 0.85;
+      discountLabel = "Được giảm giá";
+    }
+
+    await docClient.send(
+      new PutCommand({
+        TableName: "EventTickets",
+        Item: {
+          ticketId: id,
+          eventName,
+          holderName,
+          category,
+          quantity: q,
+          pricePerTicket: p,
+          eventDate,
+          status,
+          imageUrl,
+          totalAmount,
+          finalAmount,
+          discountLabel
+        }
+      })
+    );
+
+    res.redirect("/");
+  } catch (err) {
+    console.error(err);
+    res.send("Error creating ticket");
+  }
+};
+
+// ================== EDIT FORM ==================
+export const showEditForm = async (req, res) => {
+  const data = await docClient.send(
+    new GetCommand({
+      TableName: "EventTickets",
+      Key: { ticketId: req.params.id }
+    })
+  );
+
+  res.render("edit", { ticket: data.Item });
+};
+
+// ================== UPDATE ==================
+export const updateTicket = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { eventName, holderName, category, quantity, pricePerTicket, eventDate, status } = req.body;
+
+    const q = Number(quantity);
+    const p = Number(pricePerTicket);
+
+    const totalAmount = q * p;
+    let finalAmount = totalAmount;
+    let discountLabel = "Không giảm giá";
+
+    if (category === "VIP" && q >= 4) {
+      finalAmount *= 0.9;
+      discountLabel = "Được giảm giá";
+    } else if (category === "VVIP" && q >= 2) {
+      finalAmount *= 0.85;
+      discountLabel = "Được giảm giá";
+    }
+
+    let updateExp = "SET eventName=:e, holderName=:h, category=:c, quantity=:q, pricePerTicket=:p, eventDate=:d, #st=:s, totalAmount=:t, finalAmount=:f, discountLabel=:dl";
+
+    let attrValues = {
+      ":e": eventName,
+      ":h": holderName,
+      ":c": category,
+      ":q": q,
+      ":p": p,
+      ":d": eventDate,
+      ":s": status,
+      ":t": totalAmount,
+      ":f": finalAmount,
+      ":dl": discountLabel
+    };
+
+    let attrNames = { "#st": "status" };
+
+    // ===== nếu có ảnh mới =====
+    if (req.file) {
+      const imageKey = `tickets/${id}-${req.file.originalname}`;
+
+      await s3.send(
+        new PutObjectCommand({
+          Bucket: process.env.BUCKET_NAME,
+          Key: imageKey,
+          Body: req.file.buffer,
+          ContentType: req.file.mimetype
+        })
+      );
+
+      const imageUrl = `https://${process.env.BUCKET_NAME}.s3.${process.env.AWS_REGION}.amazonaws.com/${imageKey}`;
+
+      updateExp += ", imageUrl=:img";
+      attrValues[":img"] = imageUrl;
+    }
+
+    await docClient.send(
+      new UpdateCommand({
+        TableName: "EventTickets",
+        Key: { ticketId: id },
+        UpdateExpression: updateExp,
+        ExpressionAttributeValues: attrValues,
+        ExpressionAttributeNames: attrNames
+      })
+    );
+
+    res.redirect("/");
+  } catch (err) {
+    console.error(err);
+    res.send("Error updating ticket");
+  }
+};
+
+// ================== DELETE ==================
+export const deleteTicket = async (req, res) => {
+  try {
+    const id = req.params.id;
+
+    const data = await docClient.send(
+      new GetCommand({
+        TableName: "EventTickets",
+        Key: { ticketId: id }
+      })
+    );
+
+    // xoá ảnh S3
+    if (data.Item?.imageUrl) {
+      const key = data.Item.imageUrl.split(".com/")[1];
+
+      await s3.send(
+        new DeleteObjectCommand({
+          Bucket: process.env.BUCKET_NAME,
+          Key: key
+        })
+      );
+    }
+
+    await docClient.send(
+      new DeleteCommand({
+        TableName: "EventTickets",
+        Key: { ticketId: id }
+      })
+    );
+
+    res.redirect("/");
+  } catch (err) {
+    console.error(err);
+    res.send("Error deleting ticket");
+  }
+};
+
+// ================== SEARCH ==================
+export const searchTicket = async (req, res) => {
+  const keyword = req.query.keyword?.toLowerCase() || "";
+
+  const data = await docClient.send(
+    new ScanCommand({ TableName: "EventTickets" })
+  );
+
+  const filtered = data.Items.filter(t =>
+    t.eventName.toLowerCase().includes(keyword) ||
+    t.holderName.toLowerCase().includes(keyword)
+  );
+
+  res.render("index", { tickets: filtered });
+};
+
+// ================== FILTER ==================
+export const filterByStatus = async (req, res) => {
+  const status = req.query.status;
+
+  const data = await docClient.send(
+    new ScanCommand({ TableName: "EventTickets" })
+  );
+
+  const filtered = data.Items.filter(t => t.status === status);
+
+  res.render("index", { tickets: filtered });
+};
+
+-routes/ticketRoutes.js:
+
+import express from "express";
+import multer from "multer";
+
+import{getAllTickets,createTicket,updateTicket,deleteTicket,searchTicket,filterByStatus,getTicketById,showEditForm} from "../controllers/ticketController.js";
+
+const router = express.Router();
+
+// ===== MULTER CONFIG =====
+const upload = multer({
+  storage: multer.memoryStorage()
+});
+
+// ===== ROUTES =====
+
+// Trang danh sách
+router.get("/", getAllTickets);
+
+// FORM THÊM VÉ 
+router.get("/add", (req, res) => {
+  res.render("add");
+});
+
+// Chi tiết
+router.get("/detail/:id", getTicketById);
+
+// Form sửa
+router.get("/edit/:id", showEditForm);
+
+// Tạo mới (có upload ảnh)
+router.post("/create", upload.single("image"), createTicket);
+
+// Cập nhật (có thể có ảnh mới)
+router.post("/update/:id", upload.single("image"), updateTicket);
+
+// Xoá
+router.get("/delete/:id", deleteTicket);
+
+// ===== SEARCH + FILTER =====
+router.get("/search", searchTicket);
+router.get("/filter", filterByStatus);
+
+export default router;
+
+- views/index.ejs:
+
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Danh sách vé</title>
+    <link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+
+<h1>Danh sách vé</h1>
+
+<!-- SEARCH -->
+<form action="/search" method="GET">
+    <input type="text" name="keyword" placeholder="Nhập tên sự kiện hoặc người sở hữu">
+    <button type="submit">Tìm</button>
+</form>
+
+<!-- FILTER -->
+<form action="/filter" method="GET">
+    <select name="status">
+        <option value="">-- Lọc trạng thái --</option>
+        <option value="Upcoming">Upcoming</option>
+        <option value="Sold">Sold</option>
+        <option value="Cancelled">Cancelled</option>
+    </select>
+    <button>Lọc</button>
+</form>
+
+<br>
+<a href="/add">Thêm vé</a>
+
+<hr>
+
+<div class="cards">
+    <% tickets.forEach(t => { %>
+        <div class="card">
+            <img src="<%= t.imageUrl %>" width="200" height="150"/>
+
+            <h3><%= t.eventName %></h3>
+            <p><b>Người giữ:</b> <%= t.holderName %></p>
+            <p><b>Loại:</b> <%= t.category %></p>
+            <p><b>Số lượng:</b> <%= t.quantity %></p>
+            <p><b>Giá:</b> <%= t.pricePerTicket %></p>
+            <p><b>Trạng thái:</b> <%= t.status %></p>
+
+            <p><b>Tổng:</b> <%= t.totalAmount %></p>
+            <p><b>Sau giảm:</b> <%= t.finalAmount %></p>
+
+            <p style="color:red;"><%= t.discountLabel %></p>
+
+            <a href="/detail/<%= t.ticketId %>">Xem</a> |
+            <a href="/edit/<%= t.ticketId %>">Sửa</a> |
+            <a href="/delete/<%= t.ticketId %>" onclick="return confirm('Xóa?')">Xóa</a>
+        </div>
+    <% }) %>
+</div>
+
+</body>
+</html>
+
+- views/add.ejs:
+
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Thêm vé</title>
+    <style>
+        body {
+            font-family: Arial;
+            padding: 20px;
+        }
+
+        input, select {
+            width: 300px;
+            padding: 8px;
+        }
+
+        button {
+            padding: 10px 20px;
+            cursor: pointer;
+        }
+
+        img {
+            margin-top: 10px;
+            border: 1px solid #ccc;
+            border-radius: 8px;
+        }
+    </style>
+</head>
+<body>
+
+<h1>Thêm vé</h1>
+
+<form action="/create" method="POST" enctype="multipart/form-data">
+
+    <label>Tên sự kiện:</label><br>
+    <input type="text" name="eventName" placeholder="Nhập tên sự kiện" required><br><br>
+
+    <label>Người sở hữu:</label><br>
+    <input type="text" name="holderName" placeholder="Nhập tên người sở hữu" required><br><br>
+
+    <label>Loại vé:</label><br>
+    <select name="category" required>
+        <option value="">-- Chọn loại --</option>
+        <option value="Standard">Standard</option>
+        <option value="VIP">VIP</option>
+        <option value="VVIP">VVIP</option>
+    </select><br><br>
+
+    <label>Số lượng:</label><br>
+    <input type="number" name="quantity" min="1" required><br><br>
+
+    <label>Giá mỗi vé:</label><br>
+    <input type="number" name="pricePerTicket" min="1" required><br><br>
+
+    <label>Ngày sự kiện:</label><br>
+    <input type="date" name="eventDate" required><br><br>
+
+    <label>Trạng thái:</label><br>
+    <select name="status">
+        <option value="Upcoming">Upcoming</option>
+        <option value="Sold">Sold</option>
+        <option value="Cancelled">Cancelled</option>
+    </select><br><br>
+
+    <label>Ảnh vé:</label><br>
+    <input type="file" name="image" id="imageInput" accept="image/*" required><br>
+
+    <!-- Preview -->
+    <img id="previewImage" src="" width="200" style="display:none;"><br><br>
+
+    <button type="submit">Thêm</button>
+
+</form>
+
+<br>
+<a href="/"> Quay lại</a>
+
+<script>
+    const input = document.getElementById("imageInput");
+    const preview = document.getElementById("previewImage");
+
+    input.addEventListener("change", function () {
+        const file = this.files[0];
+
+        if (file) {
+            // check file phải là ảnh
+            if (!file.type.startsWith("image/")) {
+                alert("Chỉ chọn file ảnh!");
+                input.value = "";
+                preview.style.display = "none";
+                return;
+            }
+
+            const reader = new FileReader();
+
+            reader.onload = function (e) {
+                preview.src = e.target.result;
+                preview.style.display = "block";
+            };
+
+            reader.readAsDataURL(file);
+        }
+    });
+</script>
+
+</body>
+</html>
+
+- views/edit.ejs:
+
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Sửa vé</title>
+    <style>
+        body {
+            font-family: Arial;
+            padding: 20px;
+        }
+
+        input, select {
+            width: 300px;
+            padding: 8px;
+        }
+
+        button {
+            padding: 10px 20px;
+            cursor: pointer;
+        }
+
+        img {
+            margin-top: 10px;
+            border: 1px solid #ccc;
+            border-radius: 8px;
+        }
+    </style>
+</head>
+<body>
+
+<h1>Sửa vé</h1>
+
+<form action="/update/<%= ticket.ticketId %>" method="POST" enctype="multipart/form-data">
+
+    <label>Tên sự kiện:</label><br>
+    <input type="text" name="eventName" value="<%= ticket.eventName %>" required><br><br>
+
+    <label>Người sở hữu:</label><br>
+    <input type="text" name="holderName" value="<%= ticket.holderName %>" required><br><br>
+
+    <label>Loại vé:</label><br>
+    <select name="category">
+        <option value="Standard" <%= ticket.category === 'Standard' ? 'selected' : '' %>>Standard</option>
+        <option value="VIP" <%= ticket.category === 'VIP' ? 'selected' : '' %>>VIP</option>
+        <option value="VVIP" <%= ticket.category === 'VVIP' ? 'selected' : '' %>>VVIP</option>
+    </select><br><br>
+
+    <label>Số lượng:</label><br>
+    <input type="number" name="quantity" value="<%= ticket.quantity %>" min="1"><br><br>
+
+    <label>Giá mỗi vé:</label><br>
+    <input type="number" name="pricePerTicket" value="<%= ticket.pricePerTicket %>" min="1"><br><br>
+
+    <label>Ngày sự kiện:</label><br>
+    <input type="date" name="eventDate" value="<%= ticket.eventDate %>"><br><br>
+
+    <label>Trạng thái:</label><br>
+    <select name="status">
+        <option value="Upcoming" <%= ticket.status === 'Upcoming' ? 'selected' : '' %>>Upcoming</option>
+        <option value="Sold" <%= ticket.status === 'Sold' ? 'selected' : '' %>>Sold</option>
+        <option value="Cancelled" <%= ticket.status === 'Cancelled' ? 'selected' : '' %>>Cancelled</option>
+    </select><br><br>
+
+    <p><b>Ảnh hiện tại:</b></p>
+    <img id="previewImage" src="<%= ticket.imageUrl %>" width="200"><br><br>
+
+    <label>Chọn ảnh mới (nếu muốn thay):</label><br>
+    <input type="file" name="image" id="imageInput" accept="image/*"><br><br>
+
+    <button type="submit">Cập nhật</button>
+
+</form>
+
+<br>
+<a href="/">Quay lại</a>
+
+<script>
+    const input = document.getElementById("imageInput");
+    const preview = document.getElementById("previewImage");
+
+    input.addEventListener("change", function () {
+        const file = this.files[0];
+
+        if (file) {
+            // kiểm tra file phải là ảnh
+            if (!file.type.startsWith("image/")) {
+                alert("Chỉ chọn file ảnh!");
+                input.value = "";
+                return;
+            }
+
+            const reader = new FileReader();
+
+            reader.onload = function (e) {
+                preview.src = e.target.result;
+            };
+
+            reader.readAsDataURL(file);
+        }
+    });
+</script>
+
+</body>
+</html>
+
+- views/detail.ejs:
+
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Chi tiết vé</title>
+</head>
+<body>
+
+<h1>Chi tiết vé</h1>
+
+<img src="<%= ticket.imageUrl %>" width="300"><br><br>
+
+<p><b>Tên sự kiện:</b> <%= ticket.eventName %></p>
+<p><b>Người sở hữu:</b> <%= ticket.holderName %></p>
+<p><b>Loại:</b> <%= ticket.category %></p>
+<p><b>Số lượng:</b> <%= ticket.quantity %></p>
+<p><b>Giá vé:</b> <%= ticket.pricePerTicket %></p>
+<p><b>Ngày:</b> <%= ticket.eventDate %></p>
+<p><b>Trạng thái:</b> <%= ticket.status %></p>
+
+<hr>
+
+<p><b>Tổng tiền:</b> <%= ticket.totalAmount %></p>
+<p><b>Sau giảm giá:</b> <%= ticket.finalAmount %></p>
+
+<p style="color:red;"><%= ticket.discountLabel %></p>
+
+<br>
+<a href="/">Quay lại</a>
+
+</body>
+</html>
+
+- app.js:
+
+import dotenv from "dotenv";
+
+dotenv.config({ path: "./.env" });
+
+import express from "express";
+const app = express();
+import ticketRoutes from "./routes/ticketRoutes.js";
+
+// ===== CONFIG =====
+app.set("view engine", "ejs");
+
+// ===== MIDDLEWARE =====
+app.use(express.urlencoded({ extended: true }));
+app.use(express.json());
+app.use(express.static("public"));
+
+// ===== ROUTES =====
+app.use("/", ticketRoutes);
+
+// ===== START SERVER =====
+app.listen(3000, () => {
+  console.log("Server running on port 3000");
+});
